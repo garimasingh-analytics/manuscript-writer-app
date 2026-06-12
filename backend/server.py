@@ -7,7 +7,7 @@ from fastapi.responses import StreamingResponse
 import os
 import logging
 from pathlib import Path
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field, EmailStr, model_validator
 from typing import List, Optional, Dict, Any
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -121,6 +121,29 @@ class StudySummary(BaseModel):
     figures: List[Dict[str, Any]] = []
     charts: List[Dict[str, Any]] = []
     raw_tables_text: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_types(cls, data):
+        """Tolerate LLM output that returns null or wrong types for fields."""
+        if not isinstance(data, dict):
+            return data
+        str_fields = {"population_setting", "sample_size", "study_design", "inclusion_criteria",
+                      "exclusion_criteria", "interventions", "comparators", "outcomes",
+                      "effect_sizes", "follow_up", "conclusions", "raw_tables_text"}
+        list_fields = {"tables", "figures", "charts"}
+        cleaned = {}
+        for k, v in data.items():
+            if k in str_fields:
+                cleaned[k] = "" if v is None else (v if isinstance(v, str) else str(v))
+            elif k in list_fields:
+                if isinstance(v, list):
+                    cleaned[k] = [item if isinstance(item, dict) else {"value": str(item)} for item in v]
+                else:
+                    cleaned[k] = []
+            else:
+                cleaned[k] = v
+        return cleaned
 
 class KeywordSet(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -418,6 +441,23 @@ Return this JSON structure (use empty string "" if not found):
             "comparators": "", "outcomes": "", "effect_sizes": "", "follow_up": "",
             "conclusions": content[:500], "tables": [], "figures": [], "charts": [], "raw_tables_text": ""
         }
+
+    # Normalize fields to match StudySummary schema (LLM sometimes returns null or wrong types)
+    _str_fields = ["population_setting", "sample_size", "study_design", "inclusion_criteria",
+                   "exclusion_criteria", "interventions", "comparators", "outcomes",
+                   "effect_sizes", "follow_up", "conclusions", "raw_tables_text"]
+    _list_fields = ["tables", "figures", "charts"]
+    clean = {}
+    for f in _str_fields:
+        v = summary_dict.get(f)
+        clean[f] = str(v) if v is not None and not isinstance(v, (list, dict)) else (str(v) if v else "")
+    for f in _list_fields:
+        v = summary_dict.get(f)
+        if isinstance(v, list):
+            clean[f] = [item if isinstance(item, dict) else {"value": str(item)} for item in v]
+        else:
+            clean[f] = []
+    summary_dict = clean
 
     await db.projects.update_one(
         {"id": project_id},
