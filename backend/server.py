@@ -59,9 +59,9 @@ logger = logging.getLogger(__name__)
 
 # ==================== CLAUDE HELPER ====================
 
-async def call_claude(prompt: str, system: str = "You are a helpful research assistant.") -> str:
+async def call_claude(prompt: str, system: str = "You are a helpful research assistant.", model: str = "claude-sonnet-4-6") -> str:
     message = await anthropic_client.messages.create(
-        model="claude-sonnet-4-6",
+        model=model,
         max_tokens=4096,
         system=system,
         messages=[{"role": "user", "content": prompt}]
@@ -404,7 +404,7 @@ Return this JSON structure (use empty string "" if not found):
 }}"""
 
     try:
-        response = await call_claude(prompt, "Extract structured data from clinical reports. Return only valid JSON, no markdown.")
+        response = await call_claude(prompt, "Extract structured data from clinical reports. Return only valid JSON, no markdown.", model="claude-haiku-4-5-20251001")
         json_start = response.find('{')
         json_end = response.rfind('}') + 1
         if json_start == -1:
@@ -688,7 +688,7 @@ Return JSON array:
 
 Classifications: "supporting" (supports study findings), "contradicting" (contradicts findings), "background" (general background)"""
         try:
-            response = await call_claude(classify_prompt, "Classify papers. Return only JSON array.")
+            response = await call_claude(classify_prompt, "Classify papers. Return only JSON array.", model="claude-haiku-4-5-20251001")
             json_start = response.find('[')
             json_end = response.rfind(']') + 1
             if json_start != -1:
