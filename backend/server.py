@@ -18,6 +18,7 @@ import asyncio
 import io
 import json
 import re
+import base64
 import anthropic
 from PyPDF2 import PdfReader
 from docx import Document
@@ -65,6 +66,23 @@ async def call_claude(prompt: str, system: str = "You are a helpful research ass
         max_tokens=4096,
         system=system,
         messages=[{"role": "user", "content": prompt}]
+    )
+    return message.content[0].text
+
+async def call_claude_with_pdf(prompt: str, pdf_bytes: bytes, system: str = "You are a helpful research assistant.", model: str = "claude-haiku-4-5-20251001") -> str:
+    """Send a PDF as document input to Claude so it can see tables, figures, and charts visually."""
+    pdf_b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+    message = await anthropic_client.messages.create(
+        model=model,
+        max_tokens=4096,
+        system=system,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64}},
+                {"type": "text", "text": prompt}
+            ]
+        }]
     )
     return message.content[0].text
 
@@ -387,27 +405,53 @@ async def parse_report(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    pdf_bytes = None
     content = ""
     if file:
         file_bytes = await file.read()
         if file.content_type == "application/pdf" or file.filename.endswith(".pdf"):
-            content = await extract_text_from_pdf(file_bytes)
+            pdf_bytes = file_bytes  # Keep raw PDF for vision input
+            content = await extract_text_from_pdf(file_bytes)  # Fallback text
         else:
             content = file_bytes.decode("utf-8", errors="ignore")
     if text_content:
         content += "\n" + text_content
 
-    if not content.strip():
+    if not content.strip() and not pdf_bytes:
         raise HTTPException(status_code=400, detail="No content provided")
 
     content = content[:12000]  # Limit to avoid token overflow
 
-    prompt = f"""Extract study information from this clinical/HEOR report. Return ONLY valid JSON.
+    vision_instructions = """Extract study information from this clinical/HEOR report. You can see tables, figures, and charts directly in the document. Return ONLY valid JSON, no markdown code blocks.
+
+EXTRACT EVERY TABLE you see. For each table, capture its label (e.g. "Table 1"), caption, column headers, and all rows.
+EXTRACT EVERY FIGURE/CHART you see. For each figure or chart, capture its label (e.g. "Figure 1"), caption, and a brief description of what it shows.
+
+Return this JSON structure (use empty string "" if a text field is not found, [] if no items found):
+{
+  "population_setting": "...",
+  "sample_size": "...",
+  "study_design": "...",
+  "inclusion_criteria": "...",
+  "exclusion_criteria": "...",
+  "interventions": "...",
+  "comparators": "...",
+  "outcomes": "...",
+  "effect_sizes": "...",
+  "follow_up": "...",
+  "conclusions": "...",
+  "tables": [{"label": "Table 1", "caption": "...", "headers": ["col1", "col2"], "rows": [["a", "b"], ["c", "d"]]}],
+  "figures": [{"label": "Figure 1", "caption": "...", "description": "shows X over time"}],
+  "charts": [{"label": "Chart 1", "caption": "...", "description": "bar chart of..."}],
+  "raw_tables_text": ""
+}"""
+
+    text_prompt = f"""Extract study information from this clinical/HEOR report. Return ONLY valid JSON.
 
 REPORT:
 {content}
 
-Return this JSON structure (use empty string "" if not found):
+Return this JSON structure (use empty string "" if not found, [] if no items):
 {{
   "population_setting": "...",
   "sample_size": "...",
@@ -420,14 +464,21 @@ Return this JSON structure (use empty string "" if not found):
   "effect_sizes": "...",
   "follow_up": "...",
   "conclusions": "...",
-  "tables": [],
-  "figures": [],
-  "charts": [],
+  "tables": [{{"label": "Table 1", "caption": "...", "headers": ["col1","col2"], "rows": [["a","b"]]}}],
+  "figures": [{{"label": "Figure 1", "caption": "...", "description": "..."}}],
+  "charts": [{{"label": "Chart 1", "caption": "...", "description": "..."}}],
   "raw_tables_text": ""
 }}"""
 
     try:
-        response = await call_claude(prompt, "Extract structured data from clinical reports. Return only valid JSON, no markdown.", model="claude-haiku-4-5-20251001")
+        if pdf_bytes:
+            # Use vision-based PDF input so Claude can see tables, figures, charts
+            response = await call_claude_with_pdf(
+                vision_instructions, pdf_bytes,
+                system="Extract structured data from clinical reports. You can see the PDF visually. Return only valid JSON, no markdown."
+            )
+        else:
+            response = await call_claude(text_prompt, "Extract structured data from clinical reports. Return only valid JSON, no markdown.", model="claude-haiku-4-5-20251001")
         json_start = response.find('{')
         json_end = response.rfind('}') + 1
         if json_start == -1:
