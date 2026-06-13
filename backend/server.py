@@ -788,8 +788,10 @@ async def process_manuscript_generation(job_id: str):
             await db.generation_jobs.update_one({"id": job_id}, {"$set": {"status": "failed", "error": "Project not found", "completed_at": datetime.now(timezone.utc).isoformat()}})
             return
 
-        study_summary = project.get("study_summary", {})
-        papers = [p for p in project.get("papers", []) if p.get("selected")]
+        study_summary = project.get("study_summary", {}) or {}
+        if not isinstance(study_summary, dict):
+            study_summary = {}
+        papers = [p for p in project.get("papers", []) if isinstance(p, dict) and p.get("selected")]
 
         if not study_summary or not papers:
             await db.generation_jobs.update_one({"id": job_id}, {"$set": {"status": "failed", "error": "Missing study summary or selected papers", "completed_at": datetime.now(timezone.utc).isoformat()}})
@@ -813,10 +815,26 @@ async def process_manuscript_generation(job_id: str):
 
         refs_text = "\n".join(f"[{r['number']}] {r['authors'][:60]}. \"{r['title'][:100]}\". {r['journal']}. {r['year']}. [{r['classification']}]" for r in references)
 
-        extracted_tables = study_summary.get("tables", [])
-        extracted_figures = study_summary.get("figures", [])
-        extracted_charts = study_summary.get("charts", [])
-        raw_tables_text = study_summary.get("raw_tables_text", "")
+        # Defensively normalize: tolerate old project data where tables/figures/charts may contain
+        # strings, None, or other non-dict items from pre-validator parses.
+        def _to_dict_list(v):
+            if not isinstance(v, list):
+                return []
+            out = []
+            for item in v:
+                if isinstance(item, dict):
+                    out.append(item)
+                elif item is None:
+                    continue
+                else:
+                    out.append({"value": str(item)})
+            return out
+        extracted_tables = _to_dict_list(study_summary.get("tables", []))
+        extracted_figures = _to_dict_list(study_summary.get("figures", []))
+        extracted_charts = _to_dict_list(study_summary.get("charts", []))
+        raw_tables_text = study_summary.get("raw_tables_text", "") or ""
+        if not isinstance(raw_tables_text, str):
+            raw_tables_text = str(raw_tables_text)
 
         visual_elements_text = ""
         if extracted_tables:
