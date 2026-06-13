@@ -21,11 +21,13 @@ import re
 import base64
 import anthropic
 from PyPDF2 import PdfReader
+import fitz  # pymupdf - for extracting images from PDFs
 from docx import Document
+from docx.shared import Inches
 from docx.shared import Pt
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Image as RLImage
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_JUSTIFY, TA_CENTER
 
@@ -394,6 +396,38 @@ async def extract_text_from_pdf(file_bytes: bytes) -> str:
         logger.error(f"PDF extraction error: {e}")
         return ""
 
+def extract_images_from_pdf(file_bytes: bytes, max_images: int = 20, min_size: int = 5000) -> List[Dict[str, Any]]:
+    """Extract embedded images (figures/charts) from a PDF using pymupdf.
+    Returns a list of dicts with base64 data, mime type, and page number, in document order.
+    Skips images below `min_size` bytes (usually decorative/logos)."""
+    images = []
+    try:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        for page_num, page in enumerate(doc, start=1):
+            for img_info in page.get_images(full=True):
+                xref = img_info[0]
+                try:
+                    img = doc.extract_image(xref)
+                    img_bytes = img.get("image", b"")
+                    if len(img_bytes) < min_size:
+                        continue
+                    ext = img.get("ext", "png")
+                    mime = f"image/{'jpeg' if ext == 'jpg' else ext}"
+                    images.append({
+                        "image_data": base64.standard_b64encode(img_bytes).decode("utf-8"),
+                        "mime_type": mime,
+                        "page": page_num,
+                    })
+                    if len(images) >= max_images:
+                        doc.close()
+                        return images
+                except Exception as e:
+                    logger.warning(f"Skipping image on page {page_num}: {e}")
+        doc.close()
+    except Exception as e:
+        logger.error(f"PDF image extraction error: {e}")
+    return images
+
 @agents_router.post("/parse-report/{project_id}")
 async def parse_report(
     project_id: str,
@@ -509,6 +543,40 @@ Return this JSON structure (use empty string "" if not found, [] if no items):
         else:
             clean[f] = []
     summary_dict = clean
+
+    # If a PDF was uploaded, extract the actual embedded images and attach them to figures/charts
+    # so they can be embedded in the manuscript export.
+    if pdf_bytes:
+        extracted_images = extract_images_from_pdf(pdf_bytes)
+        if extracted_images:
+            # Match extracted images to figure/chart descriptions by order. Any extras go to figures.
+            fig_count = len(summary_dict["figures"])
+            chart_count = len(summary_dict["charts"])
+            img_idx = 0
+            # Attach to figures first
+            for i in range(fig_count):
+                if img_idx >= len(extracted_images):
+                    break
+                summary_dict["figures"][i]["image_data"] = extracted_images[img_idx]["image_data"]
+                summary_dict["figures"][i]["mime_type"] = extracted_images[img_idx]["mime_type"]
+                img_idx += 1
+            # Then charts
+            for i in range(chart_count):
+                if img_idx >= len(extracted_images):
+                    break
+                summary_dict["charts"][i]["image_data"] = extracted_images[img_idx]["image_data"]
+                summary_dict["charts"][i]["mime_type"] = extracted_images[img_idx]["mime_type"]
+                img_idx += 1
+            # If there are still images but Claude found no figures/charts, append them as untitled figures
+            while img_idx < len(extracted_images):
+                summary_dict["figures"].append({
+                    "label": f"Figure {len(summary_dict['figures']) + 1}",
+                    "caption": "",
+                    "description": "",
+                    "image_data": extracted_images[img_idx]["image_data"],
+                    "mime_type": extracted_images[img_idx]["mime_type"],
+                })
+                img_idx += 1
 
     await db.projects.update_one(
         {"id": project_id},
@@ -1089,6 +1157,50 @@ async def export_docx(project_id: str, user: dict = Depends(get_current_user)):
     for heading, key in [("Abstract", "abstract"), ("Introduction", "introduction"), ("Methods", "methods"), ("Results", "results"), ("Evidence Comparison", "evidence_comparison"), ("Discussion", "discussion"), ("Conclusion", "conclusion")]:
         doc.add_heading(heading, 1)
         doc.add_paragraph(m.get(key, ""))
+
+    # Embed actual figure/chart images extracted from the source PDF
+    def _add_image_items(items, default_label):
+        for idx, item in enumerate(items or []):
+            if not isinstance(item, dict):
+                continue
+            label = item.get("label") or f"{default_label} {idx + 1}"
+            caption = item.get("caption") or ""
+            description = item.get("description") or ""
+            image_data = item.get("image_data")
+            if image_data:
+                try:
+                    img_bytes = base64.standard_b64decode(image_data)
+                    doc.add_heading(label, 2)
+                    if caption:
+                        cap_p = doc.add_paragraph(caption)
+                        cap_p.runs[0].italic = True if cap_p.runs else None
+                    doc.add_picture(io.BytesIO(img_bytes), width=Inches(5.5))
+                    if description:
+                        doc.add_paragraph(description)
+                except Exception as e:
+                    logger.warning(f"Could not embed image for {label}: {e}")
+                    doc.add_heading(label, 2)
+                    if caption:
+                        doc.add_paragraph(caption)
+                    if description:
+                        doc.add_paragraph(description)
+            elif caption or description:
+                doc.add_heading(label, 2)
+                if caption:
+                    doc.add_paragraph(caption)
+                if description:
+                    doc.add_paragraph(description)
+
+    study_summary = project.get("study_summary", {}) or {}
+    figures = study_summary.get("figures") or m.get("figures") or []
+    charts = study_summary.get("charts") or m.get("charts") or []
+    if figures:
+        doc.add_heading("Figures", 1)
+        _add_image_items(figures, "Figure")
+    if charts:
+        doc.add_heading("Charts", 1)
+        _add_image_items(charts, "Chart")
+
     doc.add_heading("References", 1)
     for ref in m.get("references", []):
         ref_text = f"[{ref.get('number', '')}] {ref.get('authors', '')}. {ref.get('title', '')}. {ref.get('journal', '')}. {ref.get('year', '')}."
@@ -1120,6 +1232,42 @@ async def export_pdf(project_id: str, user: dict = Depends(get_current_user)):
             if para.strip():
                 safe = para.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
                 story.append(Paragraph(safe, styles['ManBody']))
+
+    # Embed extracted figure/chart images
+    study_summary = project.get("study_summary", {}) or {}
+    figures = study_summary.get("figures") or m.get("figures") or []
+    charts = study_summary.get("charts") or m.get("charts") or []
+    def _add_pdf_image_items(items, default_label):
+        for idx, item in enumerate(items or []):
+            if not isinstance(item, dict):
+                continue
+            label = item.get("label") or f"{default_label} {idx + 1}"
+            caption = item.get("caption") or ""
+            description = item.get("description") or ""
+            image_data = item.get("image_data")
+            story.append(Paragraph(label, styles['ManHead']))
+            if image_data:
+                try:
+                    img_bytes = base64.standard_b64decode(image_data)
+                    rl_img = RLImage(io.BytesIO(img_bytes), width=400, height=300, kind='proportional')
+                    story.append(rl_img)
+                except Exception as e:
+                    logger.warning(f"PDF embed failed for {label}: {e}")
+            if caption:
+                safe = caption.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                story.append(Paragraph(f"<i>{safe}</i>", styles['ManBody']))
+            if description:
+                safe = description.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                story.append(Paragraph(safe, styles['ManBody']))
+    if figures:
+        story.append(PageBreak())
+        story.append(Paragraph("Figures", styles['ManHead']))
+        _add_pdf_image_items(figures, "Figure")
+    if charts:
+        story.append(PageBreak())
+        story.append(Paragraph("Charts", styles['ManHead']))
+        _add_pdf_image_items(charts, "Chart")
+
     story.append(PageBreak())
     story.append(Paragraph("References", styles['ManHead']))
     for ref in m.get("references", []):
